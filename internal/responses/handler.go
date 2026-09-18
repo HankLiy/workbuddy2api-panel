@@ -69,26 +69,45 @@ func (c *captureWriter) Header() http.Header { return c.header }
 
 func (c *captureWriter) WriteHeader(status int) {
 	c.status = status
-	ct := c.header.Get("Content-Type")
-	if status == http.StatusOK && strings.Contains(ct, "text/event-stream") {
-		c.streaming = true
-		dst := c.w.Header()
-		dst.Set("Content-Type", "text/event-stream")
-		dst.Set("Cache-Control", "no-cache")
-		dst.Set("Connection", "keep-alive")
-		dst.Set("X-Accel-Buffering", "no") // 反代后也不缓冲
-		c.w.WriteHeader(http.StatusOK)
-		c.stream = newStreamConverter(c.w, c.ec)
-		c.stream.start()
-	}
+	c.maybeStartStream()
 }
 
 func (c *captureWriter) Write(p []byte) (int, error) {
+	// chat 面流式出口（upstream.StreamHint）只设 Header 从不显式 WriteHeader，
+	// 首个 Write 隐式 200——所以流式判定必须在这里兜底，不能只看 WriteHeader。
+	c.maybeStartStream()
 	if c.streaming {
 		c.stream.feed(p)
 		return len(p), nil
 	}
 	return c.buf.Write(p)
+}
+
+// maybeStartStream：一旦判定 chat 面在回 SSE（status 200/隐式 200 + Content-Type
+// 为 event-stream；或 body 以 data:/event: 开头的嗅探兑底），切换到流式转换模式。
+// 幂等。
+func (c *captureWriter) maybeStartStream() {
+	if c.streaming {
+		return
+	}
+	if c.status != 0 && c.status != http.StatusOK {
+		return // 错误响应走缓冲透传
+	}
+	ct := c.header.Get("Content-Type")
+	isSSE := strings.Contains(ct, "text/event-stream")
+	if !isSSE {
+		return
+	}
+	c.streaming = true
+	c.status = http.StatusOK
+	dst := c.w.Header()
+	dst.Set("Content-Type", "text/event-stream")
+	dst.Set("Cache-Control", "no-cache")
+	dst.Set("Connection", "keep-alive")
+	dst.Set("X-Accel-Buffering", "no") // 反代后也不缓冲
+	c.w.WriteHeader(http.StatusOK)
+	c.stream = newStreamConverter(c.w, c.ec)
+	c.stream.start()
 }
 
 // Flush 实现 http.Flusher：chat 面每帧都会 Flush，这里只需透传——

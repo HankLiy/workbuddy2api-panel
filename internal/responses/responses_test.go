@@ -434,6 +434,35 @@ func TestBadRequests(t *testing.T) {
 	}
 }
 
+// fakeChatImplicitHeader 模拟 upstream.StreamHint 的真实形态：
+// 只 w.Header().Set(...)，从不显式 WriteHeader，首个 Write 隐式 200。
+func fakeChatImplicitHeader(sse string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		io.WriteString(w, sse) // 隐式 WriteHeader(200)
+	})
+}
+
+func TestStreamImplicitHeader(t *testing.T) {
+	sse := `data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}` + "\n\n" +
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}` + "\n\n" +
+		`data: [DONE]` + "\n\n"
+	h := Wrap(fakeChatImplicitHeader(sse))
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(
+		`{"model":"m","input":"hi","stream":true}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != 200 || !strings.Contains(rec.Header().Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("code=%d ct=%s body=%s", rec.Code, rec.Header().Get("Content-Type"), rec.Body.String())
+	}
+	events := collectEvents(t, rec)
+	if events[len(events)-1]["type"] != "response.completed" {
+		t.Fatalf("events=%v", eventTypes(events))
+	}
+}
+
 // ---------- 工具 ----------
 
 func mustJSON(t *testing.T, s string, v any) {
