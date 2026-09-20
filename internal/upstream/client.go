@@ -582,6 +582,30 @@ type Client struct {
 	// DeviceTokenFile 设备 token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
 	DeviceTokenFile string
 
+	// Proxy 全局出站代理（config upstream.proxy，归一化后使用）。空 = 直连；
+	// 每号 auth.Auth.Proxy 优先于本项。取值可为 IP 池代号或裸 URL（见 ProxyPool）。
+	Proxy string
+
+	// ProxyPool 代理代号解析器（面板 IP 池）。nil = 不支持代号（只认 URL）。
+	// 账号/全局的代理值先经它按代号解析，未命中再按裸 URL 处理。
+	ProxyPool ProxyPoolResolver
+
+	// AccountProxy 账号→代理引用（代号或 URL）解析器，对应 config.json 的
+	// account_proxies 段（账号绑定写在配置里，而非 auths/*.json）。nil = 无账号级绑定。
+	AccountProxy AccountProxyResolver
+
+	// proxyStatMu/proxyStats 按代理引用（代号/URL/""）累计运行期出站统计，供面板
+	// IP 池展示「哪个节点在坏」（传输层错误率）。
+	proxyStatMu sync.Mutex
+	proxyStats  map[string]*proxyStat
+
+	// trMu 保护 trCache/jsonClients/chatClients：按归一化代理串缓存 transport 与
+	// client，相同代理复用连接池，不同代理隔离（多号防关联的一部分）。
+	trMu        sync.Mutex
+	trCache     map[string]*http.Transport
+	jsonClients map[string]*http.Client
+	chatClients map[string]*http.Client
+
 	ChatBaseCN    string
 	BillingBaseCN string
 	// WebBaseCN 官网（workbuddy.cn）域：部分「任务领奖」类接口只在此域提供
@@ -623,6 +647,193 @@ func (c *Client) chatHTTP() *http.Client {
 		return c.ChatHTTP
 	}
 	return c.HTTP
+}
+
+// ProxyPoolResolver 解析代理代号（面板 IP 池）。实现见 internal/proxypool.Pool。
+type ProxyPoolResolver interface {
+	Lookup(code string) (url string, found, enabled bool)
+}
+
+// AccountProxyResolver 返回账号绑定的代理引用（代号或 URL；空 = 未绑定）。
+// 实现见 internal/proxypool.AccountMap。
+type AccountProxyResolver interface {
+	ProxyRef(uid string) string
+}
+
+// proxyFor 生效出站代理：账号绑定 > 全局 > 空（直连）。账号绑定与全局的取值可为
+// IP 池代号（经 ProxyPool 解析）或裸 URL（向后兼容）。代号命中但停用 → 该层不用，
+// 回落下一层。
+func (c *Client) proxyFor(a *auth.Auth) string {
+	if c.AccountProxy != nil && a != nil {
+		if ref := strings.TrimSpace(c.AccountProxy.ProxyRef(a.UID)); ref != "" {
+			// 账号绑定：允许池代号或带 scheme 的完整 URL；裸 host:port 不猜测（防代号错字）。
+			if url, ok := c.resolveRef(ref, false); ok {
+				return url
+			}
+		}
+	}
+	// 全局：允许裸 host:port（无 scheme 默认 http://）。
+	if url, ok := c.resolveRef(c.Proxy, true); ok {
+		return url
+	}
+	return ""
+}
+
+// resolveRef 把「代号或 URL」解析为可用代理 URL。返回 ok=false 表示不使用代理：
+// 空串、命中 IP 池但该条目已停用、或（allowBareHost=false 时）既非池代号也不含 scheme
+// （防止代号错字被当成 http://<错字> 去拨号）。
+func (c *Client) resolveRef(raw string, allowBareHost bool) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false
+	}
+	if c.ProxyPool != nil {
+		if url, found, enabled := c.ProxyPool.Lookup(raw); found {
+			return url, enabled
+		}
+	}
+	if !allowBareHost && !strings.Contains(raw, "://") {
+		return "", false
+	}
+	return raw, true
+}
+
+// ProxyStatSnapshot 单个代理引用的运行期统计快照（面板展示）。
+type ProxyStatSnapshot struct {
+	Ref          string    `json:"ref"`
+	Total        int64     `json:"total"`
+	TransportErr int64     `json:"transport_err"`
+	LastErr      string    `json:"last_error,omitempty"`
+	LastErrAt    time.Time `json:"last_error_at,omitempty"`
+}
+
+// proxyStat 内部可变计数。
+type proxyStat struct {
+	total     int64
+	transErr  int64
+	lastErr   string
+	lastErrAt time.Time
+}
+
+// proxyKey 生效的代理引用键（账号绑定 > 全局 > ""=直连），用作运行期统计的分组维度。
+func (c *Client) proxyKey(a *auth.Auth) string {
+	if c.AccountProxy != nil && a != nil {
+		if ref := strings.TrimSpace(c.AccountProxy.ProxyRef(a.UID)); ref != "" {
+			return ref
+		}
+	}
+	return strings.TrimSpace(c.Proxy)
+}
+
+// doWithStats 发请求并累计该代理引用的运行期统计（尝试数 + 传输层错误）。
+// 仅统计传输层（Do 失败：连接/TLS/超时）；HTTP 状态码与业务错误不算链路问题。
+func (c *Client) doWithStats(rt *http.Client, req *http.Request, a *auth.Auth) (*http.Response, error) {
+	key := c.proxyKey(a)
+	c.proxyStatMu.Lock()
+	if c.proxyStats == nil {
+		c.proxyStats = make(map[string]*proxyStat)
+	}
+	st := c.proxyStats[key]
+	if st == nil {
+		st = &proxyStat{}
+		c.proxyStats[key] = st
+	}
+	st.total++
+	c.proxyStatMu.Unlock()
+
+	resp, err := rt.Do(req)
+	if err != nil {
+		c.proxyStatMu.Lock()
+		st.transErr++
+		st.lastErr = err.Error()
+		st.lastErrAt = time.Now()
+		c.proxyStatMu.Unlock()
+	}
+	return resp, err
+}
+
+// ProxyStats 返回各代理引用的运行期统计快照（按引用名排序）。
+func (c *Client) ProxyStats() []ProxyStatSnapshot {
+	c.proxyStatMu.Lock()
+	defer c.proxyStatMu.Unlock()
+	out := make([]ProxyStatSnapshot, 0, len(c.proxyStats))
+	for k, st := range c.proxyStats {
+		out = append(out, ProxyStatSnapshot{
+			Ref: k, Total: st.total, TransportErr: st.transErr,
+			LastErr: st.lastErr, LastErrAt: st.lastErrAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Ref < out[j].Ref })
+	return out
+}
+
+// httpFor 返回账号出站使用的 JSON client：无生效代理时用共享的 c.HTTP（含测试注入），
+// 否则用按代理缓存的 client。
+func (c *Client) httpFor(a *auth.Auth) *http.Client { return c.clientFor(c.proxyFor(a), false) }
+
+// chatFor 返回账号出站使用的聊天 client（Timeout=0，首字节由 ResponseHeaderTimeout 管）。
+func (c *Client) chatFor(a *auth.Auth) *http.Client { return c.clientFor(c.proxyFor(a), true) }
+
+// clientFor 按代理串选 client。空/非法代理回落直连；非空走按代理缓存的 transport。
+// 账号级与全局代理都是「稳定串」，同一账号/同一代理的请求复用同一连接池。
+func (c *Client) clientFor(proxy string, chat bool) *http.Client {
+	key, ok := normalizeProxy(proxy)
+	if !ok {
+		log.Printf("WARN: [upstream] 代理 %q 非法或不支持（支持 http/https/socks5），回落直连", proxy)
+		key = ""
+	}
+	if key == "" {
+		if chat {
+			return c.chatHTTP() // ChatHTTP 非空取之，否则回落 HTTP（保留旧行为/测试注入）
+		}
+		return c.HTTP
+	}
+	c.trMu.Lock()
+	defer c.trMu.Unlock()
+	cache := c.jsonClients
+	if chat {
+		cache = c.chatClients
+	}
+	if cl, ok := cache[key]; ok {
+		return cl
+	}
+	tr := c.transportForLocked(key)
+	timeout := 120 * time.Second
+	if chat {
+		timeout = 0 // 聊天 SSE 无总时长（首字节由 Transport.ResponseHeaderTimeout 约束）
+	}
+	cl := &http.Client{Timeout: timeout, Transport: tr}
+	if chat {
+		if c.chatClients == nil {
+			c.chatClients = make(map[string]*http.Client)
+		}
+		c.chatClients[key] = cl
+	} else {
+		if c.jsonClients == nil {
+			c.jsonClients = make(map[string]*http.Client)
+		}
+		c.jsonClients[key] = cl
+	}
+	return cl
+}
+
+// transportForLocked 返回某代理对应的共享 *http.Transport（key 已归一化、非空）。
+// 需持 c.trMu。同一代理的账号复用同一连接池；不同代理互不串用。
+func (c *Client) transportForLocked(key string) *http.Transport {
+	if c.trCache == nil {
+		c.trCache = make(map[string]*http.Transport)
+	}
+	if tr, ok := c.trCache[key]; ok {
+		return tr
+	}
+	tr := newTransport()
+	if u, err := url.Parse(key); err == nil {
+		tr.Proxy = http.ProxyURL(u)
+	} else {
+		log.Printf("WARN: [upstream] 解析代理 %q 失败（%v），该连接回落直连", key, err)
+	}
+	c.trCache[key] = tr
+	return tr
 }
 
 // defaultGlobalBase 缺省 global base（D5：config 未覆盖时默认 workbuddy.ai）。
@@ -776,8 +987,8 @@ func (c *Client) webBase(a *auth.Auth) string {
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
-func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
-	resp, err := c.HTTP.Do(req)
+func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error) {
+	resp, err := c.doWithStats(c.httpFor(a), req, a)
 	if err != nil {
 		return nil, err
 	}
@@ -857,7 +1068,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	c.RefreshHeaders(req, &hdrSnapshot)
 
 	// 网络 I/O（锁外，30s 上限）。
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(req, a)
 	if err != nil {
 		return err
 	}
@@ -953,14 +1164,14 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
 		req = req.WithContext(reqCtx)
-		resp, err := c.chatHTTP().Do(req)
+		resp, err := c.doWithStats(c.chatFor(a), req, a)
 		if err != nil {
 			cancel()
 			log.Printf("ERR: [upstream] chat_stream acct=%s: transport error: %v", logfmt.Label(a.UID, a.Nickname), err)
 			// 传输层失败 → 清空共享连接池的空闲连接（连接层加固）：失败连接可能仍
 			// 留在空闲池里，下一个请求会继续捡到它——仅靠 IdleConnTimeout 等过期
 			// 不够，主动清池才断根。
-			roundTripCloseIdle(c.chatHTTP().Transport)
+			roundTripCloseIdle(c.chatFor(a).Transport)
 			return nil, 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
@@ -1213,7 +1424,7 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.doWithStats(c.httpFor(a), req, a)
 	if err != nil {
 		return nil, err
 	}
@@ -1360,7 +1571,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, erro
 	req.Header.Set("X-Product", "SaaS")
 	req.Header.Set("User-Agent", codeBuddyIDEUA)
 	c.injectCodeBuddyRequest(req)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.doWithStats(c.httpFor(a), req, a)
 	if err != nil {
 		return nil, err
 	}

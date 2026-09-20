@@ -9,6 +9,8 @@ import (
 	"crypto/tls"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -86,6 +88,36 @@ func newTransport() *http.Transport {
 		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
 }
+
+// normalizeProxy 归一化代理串：去首尾空白；无 scheme 默认 http://；socks5h 归一为
+// socks5（Go 的 socks5 dialer 默认把域名交给代理端解析，语义等同 socks5h）。返回
+// (归一化串, 是否合法)；空串合法（= 直连）。非法/不支持的 scheme 返回 ok=false，
+// 调用方回落直连并告警。
+func normalizeProxy(raw string) (string, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", true
+	}
+	if !strings.Contains(s, "://") {
+		s = "http://" + s
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Host == "" {
+		return "", false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+	case "socks5", "socks5h":
+		u.Scheme = "socks5"
+	default:
+		return "", false
+	}
+	return u.String(), true
+}
+
+// NormalizeProxy 归一化并校验代理串（面板保存前校验用）：空串合法（直连），无 scheme
+// 默认 http://，socks5h→socks5。返回 (归一化串, 是否合法)。
+func NormalizeProxy(raw string) (string, bool) { return normalizeProxy(raw) }
 
 // closeIdler 实现该接口的 RoundTripper 支持清空空闲连接池（*http.Transport、
 // http2.Transport 等均满足；测试注入的自定义 RoundTripper 可选择性实现）。

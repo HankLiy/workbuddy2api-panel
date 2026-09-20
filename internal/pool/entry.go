@@ -78,6 +78,9 @@ type Status struct {
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
 	Realm           string     `json:"realm,omitempty"`
+	// Proxy 该账号绑定的 per-account 出站代理引用（代号或 URL；空 = 回落全局/直连）。
+	// 由面板从 config account_proxies 注入（pool 包不依赖代理池）。
+	Proxy           string     `json:"proxy,omitempty"`
 	Disabled        bool       `json:"disabled"`
 	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
 	SuccessCount    int64      `json:"success_count,omitempty"`
