@@ -3,6 +3,9 @@
 本 fork 在 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)
 之上叠加两个功能，设计目标是**同步上游时零冲突**。
 
+> 自用 fork，不向上游提 PR：整个仓库只有一条分支 **`main`**，
+> 它同时承载「上游最新代码 + 本 fork 的功能」。构建、部署、同步都在 `main` 上进行。
+
 ## 与上游的差异（全部改动）
 
 | 改动 | 位置 | 与上游代码的接触面 |
@@ -14,20 +17,22 @@
 
 ## 分支布局
 
-- `main`：跟踪上游，**不在上面直接开发**
-- `mine`：你的功能分支（当前部署分支）
+只有一条分支 `main`，别无其他（`mine` 已废弃/删除）。
+
+- 上游远程：`upstream` = `linguo2625469/workbuddy2api-panel`
+- 本 fork 远程：`origin` = `HankLiy/workbuddy2api-panel`
+- 本地 `main` 已配置 `upstream`，用 merge 方式吸收上游（不 rebase、不 force-push）
 
 ## 同步上游（想要上游新功能时）
 
 ```bash
 git fetch upstream
-git checkout main && git merge --ff-only upstream/main && git push origin main
-git checkout mine && git rebase main
-# 唯一可能冲突的是 go.mod/go.sum → go mod tidy 后 git rebase --continue
-git push --force-with-lease origin mine
+git checkout main
+git merge upstream/main        # 把上游新提交合进来；仅 go.mod/go.sum 可能冲突 → go mod tidy 后提交
+git push origin main
 ```
 
-或在 GitHub 网页上点 **Sync fork**，然后本地 `mine` 上 `git rebase origin/main`。
+也可以直接在 GitHub 网页点 **Sync fork**（它等价于把上游默认分支合并进你的 `main`）。
 
 平时不需要任何维护；建议只在想要上游的某个新功能时才同步。
 
