@@ -126,7 +126,7 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', ipool: 'IP 池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -134,6 +134,7 @@ function go(v) {
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
+  if (v === 'ipool') loadPool();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
@@ -146,7 +147,7 @@ go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accou
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -187,8 +188,9 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' + (s.proxy ? '<div class="id" title="出站代理：' + esc(s.proxy) + '">代理 ' + esc(s.proxy) + '</div>' : '') + '</td>' +
       '<td>' + tag + note + '</td>' +
+      '<td class="pxy"><select class="pxy-sel' + (s.proxy ? ' on' : '') + '" data-u="' + esc(s.uid) + '" title="出站代理（IP 池代号）；默认 = 全局/直连">' + pxOptions(s.proxy) + '</select></td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
@@ -257,12 +259,31 @@ $('accBody').addEventListener('click', async ev => {
       toast('已禁用', 'ok');
     } else if (a === 'tasks') {
       openTasks(u);
+    } else if (a === 'proxy') {
+      const cur = (overviewData.accounts || []).find(x => x.uid === u);
+      const v = prompt('账号出站代理（留空 = 清除，回落全局/直连）\n支持 http/https/socks5，如 socks5://127.0.0.1:1080（无 scheme 默认 http://）', (cur && cur.proxy) || '');
+      if (v === null) return; // 取消
+      const r = await api('accounts/' + encodeURIComponent(u) + '/proxy', { method: 'POST', body: JSON.stringify({ proxy: v.trim() }) });
+      toast(r.proxy ? '代理已设为 ' + r.proxy : '代理已清除', 'ok');
     } else if (a === 'remove') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/remove', { method: 'POST' });
       toast(r.file_error ? '已移除（凭证文件删除失败：' + r.file_error + '）' : '已移除', 'ok');
     }
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; loadOverview(true); }
+});
+
+// 账号代理下拉变化：按所选代号/URL 保存到该账号 auth 文件（立即生效）。
+$('accBody').addEventListener('change', async ev => {
+  const sel = ev.target.closest('select.pxy-sel');
+  if (!sel) return;
+  const u = sel.dataset.u;
+  sel.disabled = true;
+  try {
+    const r = await api('accounts/' + encodeURIComponent(u) + '/proxy', { method: 'POST', body: JSON.stringify({ proxy: sel.value }) });
+    toast(r.proxy ? '代理已设为 ' + r.proxy : '代理已清除', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+  finally { sel.disabled = false; loadOverview(true); }
 });
 
 $('btnCheckinAll').onclick = async () => {
@@ -397,6 +418,7 @@ const CFG_MAP = {
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
+  jitter_minutes: ['schedule', 'jitter_minutes'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   breaker_threshold: ['pool', 'breaker_threshold'],
   degrade_threshold: ['pool', 'degrade_threshold'], degrade_cooldown: ['pool', 'degrade_cooldown'],
@@ -408,6 +430,7 @@ const CFG_MAP = {
   ttl: ['session_sticky', 'ttl'],
   timeout_seconds: ['upstream', 'timeout_seconds'], header_timeout_seconds: ['upstream', 'header_timeout_seconds'],
   idle_timeout_seconds: ['upstream', 'idle_timeout_seconds'], user_agent: ['upstream', 'user_agent'],
+  upstream_proxy: ['upstream', 'proxy'],
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
@@ -588,9 +611,11 @@ $('btnRefresh').onclick = async () => {
 function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
   else if (view === 'logs') loadLogs();
+  else if (view === 'ipool') refreshPool();
   else if (view === 'taskscenter') pollQueueOnce();
 }
 function start() {
+  refreshPool();
   loadOverview(true);
   if (refTimer) clearInterval(refTimer);
   refTimer = setInterval(refreshVisible, 5000);
@@ -1571,3 +1596,172 @@ async function loadPackages() {
 }
 
 if ($('btnPk')) $('btnPk').onclick = loadPackages;
+
+/* ── IP 池 ────────────────────────────────────────────────────────── */
+let poolEntries = [];
+let poolCodes = [];
+let poolOther = [];
+const poolTests = {};
+let poolEditCode = null;
+
+// pxOptions 生成账号代理下拉的 <option>：空=默认，随后为池内代号；当前值不在池内时
+// 追加「自定义」项，避免编辑后下拉回退丢掉已存值。
+function pxOptions(cur) {
+  const out = ['<option value="">默认</option>'];
+  let matched = false;
+  for (const c of poolCodes) {
+    const sel = (cur && String(cur).toLowerCase() === String(c).toLowerCase()) ? ' selected' : '';
+    if (sel) matched = true;
+    out.push('<option value="' + esc(c) + '"' + sel + '>' + esc(c) + '</option>');
+  }
+  if (cur && !matched) out.push('<option value="' + esc(cur) + '" selected>自定义: ' + esc(cur) + '</option>');
+  return out.join('');
+}
+
+async function refreshPool() {
+  try {
+    const d = await api('proxypool');
+    poolEntries = d.entries || [];
+    poolOther = d.other || [];
+    poolCodes = poolEntries.map(e => e.code);
+    if (view === 'ipool') renderPool();
+    else if (view === 'accounts') loadOverview(true);
+  } catch (e) { /* 未启用 IP 池：静默 */ }
+}
+
+async function loadPool() {
+  try {
+    const d = await api('proxypool');
+    poolEntries = d.entries || [];
+    poolOther = d.other || [];
+    poolCodes = poolEntries.map(e => e.code);
+    renderPool();
+    resetPxForm();
+  } catch (e) {
+    $('pxBody').innerHTML = '<tr><td colspan="9"><div class="empty">读取失败：' + esc(e.message) + '</div></td></tr>';
+  }
+}
+
+// pxLinkCell 运行期传输层质量：err/total（error 率），带最近错误 tooltip。
+function pxLinkCell(e) {
+  const total = e.rt_total || 0, err = e.rt_err || 0;
+  if (!total) return '<span style="color:var(--ink-3)">—</span>';
+  const pct = Math.round(err / total * 100);
+  const color = err === 0 ? 'var(--ok)' : (pct >= 50 ? 'var(--bad)' : 'var(--warn)');
+  let tip = err + '/' + total + ' 次传输层错误';
+  if (e.rt_last_error) tip += '\n最近：' + e.rt_last_error + (e.rt_last_error_at ? '（' + ago(e.rt_last_error_at) + '）' : '');
+  return '<span style="color:' + color + '" title="' + esc(tip) + '">' + err + '/' + total + '</span>';
+}
+
+function renderPoolOther() {
+  const el = $('pxOther');
+  if (!el) return;
+  if (!poolOther.length) { el.textContent = ''; return; }
+  el.innerHTML = '未绑定账号的链路（全局 / 直连）：' + poolOther.map(o => {
+    const name = o.ref ? esc(o.ref) : '直连';
+    const err = o.transport_err || 0;
+    const color = err === 0 ? 'var(--ok)' : 'var(--bad)';
+    return '<span style="margin-left:12px">' + name + ' <span style="color:' + color + '">' + err + '/' + (o.total || 0) + '</span></span>';
+  }).join('');
+}
+
+function renderPool() {
+  const tb = $('pxBody');
+  if (!poolEntries.length) {
+    tb.innerHTML = '<tr><td colspan="9"><div class="empty">还没有代理节点。在上方填代号 + 地址（如 HK01 → socks5://127.0.0.1:11001）后点「保存条目」</div></td></tr>';
+    renderPoolOther();
+    return;
+  }
+  tb.innerHTML = poolEntries.map(e => {
+    const accts = (e.accounts || []);
+    const names = accts.length
+      ? accts.map(a => esc(a.nickname || String(a.uid || '').slice(0, 8))).join('、')
+      : '<span style="color:var(--ink-3)">未绑定</span>';
+    const t = poolTests[e.code];
+    let health;
+    if (!t) health = '<span style="color:var(--ink-3)">未测试</span>';
+    else if (t.ok) health = '<span style="color:var(--ok)">' + esc(t.ip || 'OK') + '</span> <span style="color:var(--ink-3)">' +
+      formatLatency(t.latency_ms) + (t.country ? ' · ' + esc(t.country) : '') + '</span>';
+    else health = '<span style="color:var(--bad)">' + esc(t.error || '失败') + '</span>';
+    return '<tr' + (e.enabled ? '' : ' class="off"') + '>' +
+      '<td class="who-cell">' + esc(e.code) + '</td>' +
+      '<td class="addr">' + esc(e.url) + '</td>' +
+      '<td class="note-cell">' + (e.note ? esc(e.note) : '—') + '</td>' +
+      '<td>' + (e.enabled ? '<span class="tag ok">启用</span>' : '<span class="tag bad">停用</span>') + '</td>' +
+      '<td>' + names + '</td>' +
+      '<td class="num">' + (e.success || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (e.err || 0) + '</span></td>' +
+      '<td class="num">' + pxLinkCell(e) + '</td>' +
+      '<td>' + health + '</td>' +
+      '<td class="acts">' +
+        '<button class="xs ghost" data-px="test" data-code="' + esc(e.code) + '">测试</button>' +
+        '<button class="xs ghost" data-px="edit" data-code="' + esc(e.code) + '">编辑</button>' +
+        '<button class="xs ghost danger" data-px="del" data-code="' + esc(e.code) + '">删除</button>' +
+      '</td></tr>';
+  }).join('');
+  renderPoolOther();
+}
+
+function resetPxForm() {
+  poolEditCode = null;
+  $('pxCode').value = ''; $('pxUrl').value = ''; $('pxNote').value = ''; $('pxEnabled').checked = true;
+  $('pxCode').disabled = false;
+  $('pxEditHint').textContent = '';
+}
+
+async function savePoolEntries() {
+  const r = await api('proxypool', { method: 'POST', body: JSON.stringify({ entries: poolEntries }) });
+  toast('已保存' + (r.restart_required && r.restart_required.length ? '（部分字段需重启）' : ''), 'ok');
+  await refreshPool();
+}
+
+$('pxBody').addEventListener('click', async ev => {
+  const b = ev.target.closest('button[data-px]');
+  if (!b) return;
+  const code = b.dataset.code, act = b.dataset.px;
+  const e = poolEntries.find(x => x.code === code);
+  if (!e) return;
+  if (act === 'edit') {
+    poolEditCode = code;
+    $('pxCode').value = e.code; $('pxUrl').value = e.url; $('pxNote').value = e.note || ''; $('pxEnabled').checked = !!e.enabled;
+    $('pxCode').disabled = true;
+    $('pxEditHint').textContent = '正在编辑 ' + code + '（代号不可改；改地址/备注/启用后点保存）';
+    return;
+  }
+  if (act === 'del') {
+    if (!confirm('删除代理节点 ' + code + '？若仍有账号绑定它，会被拒绝（请先在「账号池」把那些账号改绑）。')) return;
+    poolEntries = poolEntries.filter(x => x.code !== code);
+    try { await savePoolEntries(); delete poolTests[code]; resetPxForm(); renderPool(); }
+    catch (err) { toast(err.message, 'err'); await refreshPool(); }
+    return;
+  }
+  if (act === 'test') {
+    b.disabled = true; b.textContent = '测试中…';
+    try {
+      const r = await api('proxypool/test', { method: 'POST', body: JSON.stringify({ url: e.url }) });
+      poolTests[code] = r;
+    } catch (err) { poolTests[code] = { ok: false, error: err.message }; }
+    renderPool();
+    return;
+  }
+});
+
+$('btnPxSave').onclick = async () => {
+  const code = $('pxCode').value.trim();
+  const url = $('pxUrl').value.trim();
+  const note = $('pxNote').value.trim();
+  const enabled = $('pxEnabled').checked;
+  if (!code) { toast('请填代号', 'err'); return; }
+  if (!/^[A-Za-z0-9_-]{1,32}$/.test(code)) { toast('代号只允许字母/数字/下划线/连字符（1-32 位）', 'err'); return; }
+  if (!url) { toast('请填代理地址', 'err'); return; }
+  if (poolEditCode) {
+    const e = poolEntries.find(x => x.code === poolEditCode);
+    if (e) { e.url = url; e.note = note; e.enabled = enabled; }
+  } else {
+    if (poolEntries.some(x => x.code.toLowerCase() === code.toLowerCase())) { toast('代号已存在：' + code, 'err'); return; }
+    poolEntries.push({ code, url, note, enabled });
+  }
+  try { await savePoolEntries(); resetPxForm(); renderPool(); }
+  catch (err) { toast(err.message, 'err'); await refreshPool(); }
+};
+$('btnPxReset').onclick = resetPxForm;
+$('btnPxReload').onclick = () => loadPool();

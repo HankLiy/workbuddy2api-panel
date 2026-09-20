@@ -12,6 +12,7 @@ package panel
 
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -24,6 +25,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/proxypool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -61,6 +63,16 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// ProxyPoolEntries 返回当前 IP 池条目（面板 IP 池页与账号代理下拉用）；
+	// nil = 未启用代号（面板不展示 IP 池页）。
+	ProxyPoolEntries func() []proxypool.Entry
+
+	// AccountProxyOf 返回账号当前绑定的代理引用（代号或 URL；空 = 未绑定）。
+	AccountProxyOf func(uid string) string
+	// SetAccountProxy 设置/清除账号绑定（ref 空 = 清除）；写 config.json 的
+	// account_proxies 并热生效。返回校验/落盘错误。
+	SetAccountProxy func(uid, ref string) error
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -153,6 +165,10 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/proxy", p.withAuth(p.accountProxy))
+	p.mux.HandleFunc("GET /panel/api/proxypool", p.withAuth(p.getProxyPool))
+	p.mux.HandleFunc("POST /panel/api/proxypool", p.withAuth(p.saveProxyPool))
+	p.mux.HandleFunc("POST /panel/api/proxypool/test", p.withAuth(p.testProxyPool))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
@@ -220,6 +236,12 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
 	}
+	accounts := p.cfg.Pool.List()
+	if p.cfg.AccountProxyOf != nil {
+		for i := range accounts {
+			accounts[i].Proxy = p.cfg.AccountProxyOf(accounts[i].UID)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":         p.cfg.Version,
 		"uptime_sec":      int(time.Since(p.started).Seconds()),
@@ -231,7 +253,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"cooling":         cooling,
 		"disabled":        disabled,
 		"in_flight_full":  inFlightFull,
-		"accounts":        p.cfg.Pool.List(),
+		"accounts":        accounts,
 	})
 }
 
@@ -398,6 +420,37 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 	p.cfg.Pool.Disable(uid, "manual disable (panel)")
 	log.Printf("panel: disable uid=%s（人工禁用）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// accountProxy 设置/清除账号级出站代理绑定（写 config.json 的 account_proxies，
+// 而非 auths/*.json）。ref 可以是 IP 池代号或带 scheme 的完整代理地址；空 = 清除。
+func (p *Panel) accountProxy(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if p.cfg.Pool.AuthByUID(uid) == nil {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	if p.cfg.SetAccountProxy == nil {
+		writeErr(w, http.StatusNotImplemented, "proxy binding not available")
+		return
+	}
+	var body struct {
+		Proxy string `json:"proxy"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<12)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if err := p.cfg.SetAccountProxy(uid, strings.TrimSpace(body.Proxy)); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ref := ""
+	if p.cfg.AccountProxyOf != nil {
+		ref = p.cfg.AccountProxyOf(uid)
+	}
+	log.Printf("panel: set account proxy uid=%s ref=%q（已写 config account_proxies）", uid, ref)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "proxy": ref})
 }
 
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），

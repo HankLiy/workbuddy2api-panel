@@ -268,8 +268,27 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .tag.warn { background: var(--warn-soft); color: var(--warn); }
 .tag.bad { background: var(--bad-soft); color: var(--bad); }
 .tag.mute { background: var(--surface-2); color: var(--ink-3); border: 1px solid var(--line); }
-.acts { display: flex; gap: 5px; justify-content: flex-end; white-space: nowrap; }
+.acts { display: flex; gap: 5px; justify-content: flex-end; align-items: center; white-space: nowrap; }
 .acts button { padding: 3.5px 8px; font-size: 12.5px; white-space: nowrap; flex: none; }
+
+/* 出口列（账号表）：独立一列的紧凑 select，与按钮同高度/同风格 */
+.acc .pxy { min-width: 92px; }
+.acc .pxy select {
+  padding: 0 8px; height: 25px; line-height: 1; font-size: 12.5px; border-radius: 6px;
+  background: var(--surface-2); color: var(--ink-2);
+}
+.acc .pxy select.on {
+  color: var(--accent); font-weight: 550; background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+}
+
+/* IP 池：表单工具行 + 地址单元格 */
+.px-tools { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 4px; }
+.px-tools .inline { font-size: 13.5px; color: var(--ink-2); }
+.px-sep { height: 1px; background: var(--line-soft); margin: 16px 0 0; }
+.acc .addr { font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
+.acc .note-cell { color: var(--ink-3); }
+.acc td.who-cell { font-weight: 550; }
 
 .empty { padding: 40px 20px; text-align: center; color: var(--ink-3); }
 .empty .big { font-size: 14px; color: var(--ink-2); margin-bottom: 6px; }
@@ -417,6 +436,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#accounts" data-view="accounts" class="on">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 13.5c.6-2.6 2.7-4 5.2-4s4.6 1.4 5.2 4"/></svg>
         账号池</a></li>
+      <li><a href="#ipool" data-view="ipool">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.6"/><path d="M2.4 8h11.2M8 2.4c1.8 2 2.7 3.8 2.7 5.6S9.8 12 8 13.6M8 2.4C6.2 4.4 5.3 6.4 5.3 8s.9 3.6 2.7 5.6"/></svg>
+        IP 池</a></li>
       <li><a href="#usage" data-view="usage">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12"/><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"/></svg>
         用量</a></li>
@@ -480,11 +502,51 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <table class="acc">
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
-            <th>账号</th><th>状态</th><th>积分</th>
+            <th>账号</th><th>状态</th><th>出口</th><th>积分</th>
             <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- IP 池 -->
+    <section class="view" id="view-ipool" hidden>
+      <div class="box">
+        <header>
+          <h3>IP 池</h3>
+          <span class="grow"></span>
+          <span class="note" id="pxNote2"></span>
+          <button class="xs" id="btnPxReload">刷新</button>
+        </header>
+        <div class="pad">
+          <div class="hint">给每个出口节点起一个代号（如 HK01），账号在「账号池」里按代号指定出口——<b>同一代号的账号共用同一出口 IP</b>。未指定的账号走全局代理/直连。测试按钮经该代理访问第三方回显服务，返回出口 IP 与延迟。</div>
+          <div class="grid3" style="margin-top:12px">
+            <label class="fld"><span class="lb">代号</span>
+              <input id="pxCode" placeholder="HK01" autocomplete="off"></label>
+            <label class="fld"><span class="lb">代理地址</span>
+              <input id="pxUrl" placeholder="socks5://127.0.0.1:11001" autocomplete="off"></label>
+            <label class="fld"><span class="lb">备注</span>
+              <input id="pxNote" placeholder="香港住宅" autocomplete="off"></label>
+          </div>
+          <div class="px-tools">
+            <label class="inline"><input type="checkbox" id="pxEnabled" checked> 启用</label>
+            <button class="primary" id="btnPxSave">保存条目</button>
+            <button id="btnPxReset">清空表单</button>
+            <span class="hint" id="pxEditHint"></span>
+          </div>
+          <div class="px-sep"></div>
+          <div class="tbl-wrap" style="margin-top:12px">
+            <table class="acc md">
+              <thead><tr>
+                <th>代号</th><th>代理地址</th><th>备注</th><th>启用</th>
+                <th>绑定账号</th><th>成功 / 失败</th><th>链路</th><th>最近测试</th><th class="c-acts"></th>
+              </tr></thead>
+              <tbody id="pxBody"></tbody>
+            </table>
+          </div>
+          <div class="hint" id="pxOther" style="margin-top:10px"></div>
         </div>
       </div>
     </section>
@@ -696,6 +758,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">刷新间隔（分钟）</span>
                 <input name="balance_refresh_minutes" type="number" min="1" placeholder="5"></label>
             </div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">排程随机错峰（分钟）</span>
+                <input name="jitter_minutes" type="number" min="0" max="60" placeholder="15">
+                <span class="hint">到点后随机延迟 0–N 分钟 + 账号间随机间隔；0 = 关闭。软化「每天整点批量动作」的脚本节律</span></label>
+            </div>
           </div>
         </div>
 
@@ -767,6 +835,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">出站 User-Agent</span>
                 <input name="user_agent" placeholder="留空 = CLI/2.63.2 CodeBuddy/2.63.2">
                 <span class="hint">影响官网积分记录「使用端」显示；需重启</span></label>
+            </div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">全局出站代理</span>
+                <input name="upstream_proxy" placeholder="留空 = 全部直连，如 socks5://127.0.0.1:1080">
+                <span class="hint">支持 http/https/socks5；每号 auth 文件的 proxy 键优先于此（一号一出口 IP）。保存即生效</span></label>
             </div>
             <div class="hr"></div>
             <div class="grid2">
