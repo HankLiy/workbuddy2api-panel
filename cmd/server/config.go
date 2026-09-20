@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/proxypool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // Config 顶层配置。
@@ -21,6 +23,14 @@ type Config struct {
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+
+	// ProxyPool 出口代理池（面板「IP 池」管理）：代号 → 代理地址。账号在 auth 文件的
+	// proxy 键里写代号即可指定出口（也可直接写 URL）。空 = 无池（账号只能写裸 URL）。
+	ProxyPool []proxypool.Entry `json:"proxy_pool"`
+
+	// AccountProxies 账号 → 代理绑定（uid → 代号或带 scheme 的 URL）。空 = 该账号走
+	// 全局/直连。绑定集中写在本文件（而非散在 auths/*.json）。
+	AccountProxies map[string]string `json:"account_proxies"`
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -38,6 +48,10 @@ type Config struct {
 		ActivityHours  []int `json:"activity_hours"`  // [10]
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
 		BlackcatHours  []int `json:"blackcat_hours"`  // [23] 夜猫子窗口（23:00–08:00 计数）
+		// JitterMinutes 排程随机错峰上限（分钟；0 = 关闭）。到点后额外随机等待
+		// [0, JitterMinutes) 再派发，账号间也加随机小间隔——软掉「每天整点、同一秒
+		// 全体账号动作」的固定节律（风控特征）。默认 15。
+		JitterMinutes int `json:"jitter_minutes"`
 		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -98,6 +112,10 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// Proxy 全局出站代理（socks5://host:port 或 http://host:port）；空 = 全部直连。
+		// 每号 auth 文件的 proxy 键优先于本项（一号一出口 IP）；未配的账号回落本项。
+		// 无 scheme 时默认 http://；支持 http/https/socks5（socks5h 归一为 socks5）。
+		Proxy string `json:"proxy"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -192,6 +210,7 @@ func Default() *Config {
 	c.Schedule.BlackcatEnabled = true
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
+	c.Schedule.JitterMinutes = 15
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -357,6 +376,9 @@ func applyEnv(c *Config) {
 			c.Upstream.PassthroughIP = b
 		}
 	}
+	if v := os.Getenv("WB2A_UPSTREAM_PROXY"); v != "" {
+		c.Upstream.Proxy = v
+	}
 	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.SanitizeBlacklistFingerprints = b
@@ -371,6 +393,56 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
 	}
+}
+
+// normalizeProxyPool 归一化并校验代理池条目（就地改写）：trim 代号/备注、归一化代理
+// 地址（无 scheme 默认 http://，socks5h→socks5）；地址非法或代号非法/重复即报错。
+func normalizeProxyPool(entries []proxypool.Entry) error {
+	for i := range entries {
+		entries[i].Code = strings.TrimSpace(entries[i].Code)
+		entries[i].Note = strings.TrimSpace(entries[i].Note)
+		raw := strings.TrimSpace(entries[i].URL)
+		if raw == "" {
+			continue // 空地址交给 proxypool.Validate 报「地址不能为空」（但无效串在此拦下）
+		}
+		norm, ok := upstream.NormalizeProxy(raw)
+		if !ok {
+			return fmt.Errorf("proxy_pool 代号 %q：无效代理地址 %q（支持 http/https/socks5）", entries[i].Code, entries[i].URL)
+		}
+		entries[i].URL = norm
+	}
+	return proxypool.Validate(entries)
+}
+
+// normalizeAccountProxies 归一化并校验账号绑定（就地改写）：ref 必须命中池内代号（大小写
+// 不敏感，原样保留用户写法），或含 "://" 且能归一化的完整代理地址；空值剔除；其余报错。
+func normalizeAccountProxies(m map[string]string, pool []proxypool.Entry) error {
+	if len(m) == 0 {
+		return nil
+	}
+	codes := make(map[string]bool, len(pool))
+	for _, e := range pool {
+		codes[strings.ToLower(strings.TrimSpace(e.Code))] = true
+	}
+	for uid, ref := range m {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			delete(m, uid)
+			continue
+		}
+		if codes[strings.ToLower(ref)] {
+			m[uid] = ref
+			continue
+		}
+		if strings.Contains(ref, "://") {
+			if norm, ok := upstream.NormalizeProxy(ref); ok {
+				m[uid] = norm
+				continue
+			}
+		}
+		return fmt.Errorf("account_proxies[%s]: 代理 %q 不是 IP 池代号，也不是完整代理地址（需带 scheme，如 socks5://127.0.0.1:1080）", uid, ref)
+	}
+	return nil
 }
 
 func (c *Config) normalize() error {
@@ -455,6 +527,14 @@ func (c *Config) normalize() error {
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
 	}
+	// 代理池归一化：trim 字段、归一化代理地址；代号校验（非空/格式/大小写不敏感唯一）。
+	if err := normalizeProxyPool(c.ProxyPool); err != nil {
+		return err
+	}
+	// 账号代理绑定归一化：ref 必须是池内代号或带 scheme 的合法 URL（其余报错）。
+	if err := normalizeAccountProxies(c.AccountProxies, c.ProxyPool); err != nil {
+		return err
+	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
 	}
@@ -481,6 +561,13 @@ func (c *Config) normalize() error {
 			c.Schedule.BalanceRefreshMinutes = 5
 		}
 		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
+	}
+	// 排程错峰：负数视为 0（关闭），>60 钳 60（避免跨过下一个排程槽位）。
+	if c.Schedule.JitterMinutes < 0 {
+		c.Schedule.JitterMinutes = 0
+	}
+	if c.Schedule.JitterMinutes > 60 {
+		c.Schedule.JitterMinutes = 60
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err

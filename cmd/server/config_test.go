@@ -47,6 +47,97 @@ func TestEnvOverride(t *testing.T) {
 	}
 }
 
+// TestUpstreamProxyParsed upstream.proxy 从文件解析；WB2A_UPSTREAM_PROXY 环境变量覆盖。
+func TestUpstreamProxyParsed(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"upstream":{"proxy":"socks5://127.0.0.1:1080"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.Proxy != "socks5://127.0.0.1:1080" {
+		t.Errorf("proxy=%q want socks5://127.0.0.1:1080", c.Upstream.Proxy)
+	}
+
+	t.Setenv("WB2A_UPSTREAM_PROXY", "http://127.0.0.1:7890")
+	c2, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.Upstream.Proxy != "http://127.0.0.1:7890" {
+		t.Errorf("env proxy=%q want http://127.0.0.1:7890", c2.Upstream.Proxy)
+	}
+}
+
+// TestProxyPoolParsedAndValidated proxy_pool 解析 + 归一化（socks5h→socks5）+ 校验。
+func TestProxyPoolParsedAndValidated(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	write := func(body string) (*Config, error) {
+		if err := os.WriteFile(fp, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return Load(fp)
+	}
+
+	c, err := write(`{"proxy_pool":[{"code":"HK01","url":"socks5h://127.0.0.1:11001","enabled":true}]}`)
+	if err != nil {
+		t.Fatalf("valid pool rejected: %v", err)
+	}
+	if len(c.ProxyPool) != 1 || c.ProxyPool[0].Code != "HK01" || c.ProxyPool[0].URL != "socks5://127.0.0.1:11001" {
+		t.Errorf("parsed pool = %+v, want HK01/socks5://127.0.0.1:11001 (socks5h normalized)", c.ProxyPool)
+	}
+
+	if _, err := write(`{"proxy_pool":[{"code":"X","url":"ftp://nope:21"}]}`); err == nil {
+		t.Error("invalid proxy url should fail load")
+	}
+	if _, err := write(`{"proxy_pool":[{"code":"x","url":"http://127.0.0.1:1"},{"code":"X","url":"http://127.0.0.1:2"}]}`); err == nil {
+		t.Error("case-insensitive duplicate code should fail load")
+	}
+}
+
+// TestAccountProxiesParsedAndValidated account_proxies：代号引用/带 scheme URL（归一化）
+// 合法；无 scheme 且非池代号（疑似错字）报错；空值剔除。
+func TestAccountProxiesParsedAndValidated(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	write := func(body string) (*Config, error) {
+		if err := os.WriteFile(fp, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return Load(fp)
+	}
+
+	c, err := write(`{"proxy_pool":[{"code":"HK01","url":"socks5://127.0.0.1:11001","enabled":true}],"account_proxies":{"u1":"HK01"}}`)
+	if err != nil {
+		t.Fatalf("valid code ref rejected: %v", err)
+	}
+	if c.AccountProxies["u1"] != "HK01" {
+		t.Errorf("ref=%q want HK01", c.AccountProxies["u1"])
+	}
+
+	c, err = write(`{"account_proxies":{"u1":"socks5h://127.0.0.1:11001"}}`)
+	if err != nil {
+		t.Fatalf("valid url ref rejected: %v", err)
+	}
+	if c.AccountProxies["u1"] != "socks5://127.0.0.1:11001" {
+		t.Errorf("url ref=%q want normalized socks5://127.0.0.1:11001", c.AccountProxies["u1"])
+	}
+
+	if _, err := write(`{"account_proxies":{"u1":"NOPE"}}`); err == nil {
+		t.Error("ref neither pool code nor scheme url should fail")
+	}
+
+	c, err = write(`{"account_proxies":{"u1":""}}`)
+	if err != nil {
+		t.Fatalf("empty ref should be dropped, not error: %v", err)
+	}
+	if len(c.AccountProxies) != 0 {
+		t.Errorf("empty ref should be removed, got %v", c.AccountProxies)
+	}
+}
+
 func TestBadDuration(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")

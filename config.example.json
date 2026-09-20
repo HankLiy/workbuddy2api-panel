@@ -3,6 +3,8 @@
   "api_key": "test_key",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "proxy_pool": [],
+  "account_proxies": {},
   "cooldown": {
     "soft_rate": "600s",
     "soft_rate_max": "2h"
@@ -19,7 +21,8 @@
     "keepalive_enabled": true,
     "blackcat_enabled": true,
     "balance_refresh_enabled": true,
-    "balance_refresh_minutes": 5
+    "balance_refresh_minutes": 5,
+    "jitter_minutes": 15
   },
   "global": {
     "enabled": true,
@@ -36,7 +39,8 @@
     "client_name": "",
     "device_token": "",
     "device_token_file": "",
-    "passthrough_ip": false
+    "passthrough_ip": false,
+    "proxy": ""
   },
   "features": {
     "sanitize_blacklist_fingerprints": true

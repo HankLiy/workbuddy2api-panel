@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/proxypool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/responses"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
@@ -150,6 +152,15 @@ func main() {
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
+	// 全局出站代理（config upstream.proxy）：空 = 直连；每号 auth 文件的 proxy 键优先。
+	up.Proxy = cfg.Upstream.Proxy
+	// 出口代理池（config proxy_pool）：代号 → 地址。账号 auth 的 proxy 键写代号即可。
+	// 面板保存配置时热替换（见 saveConfig），up.ProxyPool 持有同一 *Pool 读到新值。
+	pp := proxypool.New(cfg.ProxyPool)
+	up.ProxyPool = pp
+	// 账号 → 代理绑定（config account_proxies）：集中写在配置文件，面板可改。
+	ap := proxypool.NewAccountMap(cfg.AccountProxies)
+	up.AccountProxy = ap
 	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
 	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
 	up.GlobalEnabled = cfg.Global.Enabled
@@ -169,6 +180,7 @@ func main() {
 		ActivityHours:  cfg.Schedule.ActivityHours,
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
 		BlackcatHours:  cfg.Schedule.BlackcatHours,
+		JitterMinutes:  cfg.Schedule.JitterMinutes,
 		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
 		ExpiringSoonWindow: cfg.ExpiringSoonDur,
 		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
@@ -182,6 +194,9 @@ func main() {
 		log.Printf("签到已禁用（schedule.checkin_enabled=false）")
 	default:
 		log.Printf("签到已启用：%v 点（签到 + 余额查询解冻）", cfg.Schedule.CheckinHours)
+	}
+	if cfg.Schedule.JitterMinutes > 0 {
+		log.Printf("排程随机错峰：每个到点后 0–%d 分钟随机延迟 + 账号间随机间隔（schedule.jitter_minutes）", cfg.Schedule.JitterMinutes)
 	}
 	switch {
 	case !cfg.Schedule.TravelEnabled:
@@ -240,6 +255,25 @@ func main() {
 		StickyCount: sessCount,
 		Version:     appVersion,
 		Live:        live,
+		// IP 池条目（面板 IP 池页 + 账号代理下拉用）。
+		ProxyPoolEntries: func() []proxypool.Entry { return pp.Entries() },
+		// 账号当前绑定的代理引用（空 = 未绑定）。
+		AccountProxyOf: func(uid string) string { return ap.ProxyRef(uid) },
+		// 设置/清除账号绑定：只提交 account_proxies 补丁，走同一套校验+落盘+热生效。
+		SetAccountProxy: func(uid, ref string) error {
+			next := ap.Snapshot()
+			if strings.TrimSpace(ref) == "" {
+				delete(next, uid)
+			} else {
+				next[uid] = ref
+			}
+			patch, err := json.Marshal(map[string]any{"account_proxies": next})
+			if err != nil {
+				return err
+			}
+			_, err = saveConfig(patch, *cfgPath, live, p, up, sch, pp, ap)
+			return err
+		},
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
@@ -248,7 +282,7 @@ func main() {
 			return Load(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch)
+			return saveConfig(raw, *cfgPath, live, p, up, sch, pp, ap)
 		},
 	})
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
@@ -328,7 +362,7 @@ func panelListenPath(listen string) string {
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, pp *proxypool.Pool, ap *proxypool.AccountMap) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -369,6 +403,17 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 	})
 	up.SanitizeFingerprints = newCfg.Features.SanitizeBlacklistFingerprints
+	// 全局出站代理热生效：transport/client 按代理串按需构建并缓存，改后下个请求即用
+	// （无需重启；账号级代理在各自 auth 文件里，不受此影响）。
+	up.Proxy = newCfg.Upstream.Proxy
+	// 代理池热替换：up.ProxyPool 持有同一 *Pool，下个请求即按新代号解析。
+	if pp != nil {
+		pp.Replace(newCfg.ProxyPool)
+	}
+	// 账号代理绑定热替换。
+	if ap != nil {
+		ap.Replace(newCfg.AccountProxies)
+	}
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)
@@ -382,6 +427,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
 		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
+	sch.SetJitterMinutes(newCfg.Schedule.JitterMinutes) // 排程错峰热生效
 
 	return restartRequiredFields(newCfg), nil
 }
