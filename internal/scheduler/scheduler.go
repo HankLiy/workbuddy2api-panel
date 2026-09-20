@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,6 +30,11 @@ type Config struct {
 	ActivityHours  []int // 默认 [10]
 	KeepaliveHours []int // 默认 [22]
 	BlackcatHours  []int // 默认 [23]：夜猫子（23:00–08:00 计数窗口）
+
+	// JitterMinutes 排程随机错峰上限（分钟；0 = 关闭）。每个到点后额外随机等待
+	// [0, JitterMinutes) 再派发，且账号间加随机小间隔——避免「每天整点、同一秒
+	// 全体账号批量动作」这种一眼脚本的固定节律（风控特征）。默认 15。
+	JitterMinutes int
 
 	// ExpiringSoonWindow 快过期积分窗口：签到/余额刷新查余额时，把到期时间
 	// <= now+window 的套餐余额标记为"快过期"（pool 据此优先消耗，见
@@ -68,6 +74,9 @@ type Scheduler struct {
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
+
+	// jitterNanos 排程随机错峰上限（纳秒，0=关闭）。atomic：面板保存配置可热改。
+	jitterNanos atomic.Int64
 }
 
 // New 构建。
@@ -87,12 +96,46 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.BlackcatHours) == 0 {
 		cfg.BlackcatHours = []int{23}
 	}
-	return &Scheduler{
+	s := &Scheduler{
 		cfg:           cfg,
 		adoptTried:    make(map[string]string),
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
 	}
+	s.SetJitterMinutes(cfg.JitterMinutes)
+	return s
+}
+
+// jitter 当前错峰上限（纳秒）。
+func (s *Scheduler) jitter() time.Duration { return time.Duration(s.jitterNanos.Load()) }
+
+// SetJitterMinutes 热更新错峰上限（分钟，<0→0，>60 钳 60）：面板保存配置时调用。
+func (s *Scheduler) SetJitterMinutes(min int) {
+	if min < 0 {
+		min = 0
+	}
+	if min > 60 {
+		min = 60
+	}
+	s.jitterNanos.Store(int64(min) * int64(time.Minute))
+}
+
+// randBelow 均匀返回 [0, max) 的随机时长；max<=0 返回 0。
+func randBelow(max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(max)))
+}
+
+// staggerBetween 账号间错峰等待：base<=0 返回 0；否则 [base, 2*base) 均匀分布。
+var accountStaggerBase = 900 * time.Millisecond
+
+func staggerBetween(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	return base + time.Duration(rand.Int63n(int64(base)))
 }
 
 // Reconfigure 热更新排程参数（面板保存配置后调用）：改时点/开关并通知运行中的循环重算。
@@ -261,8 +304,19 @@ func (s *Scheduler) Run(ctx context.Context) {
 			// 迟到唤醒（睡眠跨过槽位时刻，timer 在唤醒瞬间才到期）先等网络宽限：
 			// 唤醒瞬间 DNS 未就绪，零宽限派发等于把唯一一次补跑机会打在注定失败
 			// 的窗口里（issue #152）；准点触发零延迟不受影响。
+			late := time.Since(next) > wakeupLateThreshold
 			if !awaitWakeupGrace(ctx, next) {
 				return // ctx 取消：放弃本批，优雅退出
+			}
+			// 准点触发叠加随机错峰：避免「每天整点、同一秒」的固定节律（脚本特征）。
+			// 迟到补跑（睡眠唤醒）已在宽限里滞过，不再叠加，保证补跑尽早落地。
+			if !late {
+				if d := randBelow(s.jitter()); d > 0 {
+					log.Printf("schedule jitter: +%s（本次错峰）", d.Round(time.Second))
+					if !sleepCtx(ctx, d) {
+						return
+					}
+				}
 			}
 			// 唤醒时全部并行派发：每类一个 goroutine，慢任务族（如活跃上报
 			// 多号 × 间隔 ≈ 数分钟睡眠）不再阻塞同槽其他任务族；返回前等全部
@@ -320,6 +374,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 func (s *Scheduler) RunCheckinNow() {
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -334,6 +389,11 @@ func (s *Scheduler) RunCheckinNow() {
 		if a.IsGlobal() {
 			continue
 		}
+		// 账号间随机错峰：避免 N 个账号在同一秒批量签到（脚本节律）。仅错峰开启时生效。
+		if !first && s.jitter() > 0 {
+			time.Sleep(staggerBetween(accountStaggerBase))
+		}
+		first = false
 		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
 			if upstream.IsAlreadyCheckin(err) {
@@ -425,6 +485,7 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -433,6 +494,11 @@ func (s *Scheduler) RunKeepaliveNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
+		// 账号间随机错峰（同签到）：避免 N 个 token 刷新挤同一秒。仅错峰开启时生效。
+		if !first && s.jitter() > 0 {
+			time.Sleep(staggerBetween(accountStaggerBase))
+		}
+		first = false
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
