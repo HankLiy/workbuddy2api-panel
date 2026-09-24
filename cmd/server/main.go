@@ -33,7 +33,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.11.1-panel"
+const appVersion = "1.11.6-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -393,7 +393,32 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		return nil, fmt.Errorf("write config: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		return nil, fmt.Errorf("replace config: %w", err)
+		// A single-file Docker bind mount cannot be renamed over its mount
+		// target (Linux returns EBUSY / "device or resource busy"). Keep the
+		// atomic path for regular files, but update the mounted file in place
+		// for this specific deployment shape.
+		if !errors.Is(err, syscall.EBUSY) {
+			return nil, fmt.Errorf("replace config: %w", err)
+		}
+		f, openErr := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
+		if openErr != nil {
+			_ = os.Remove(tmp)
+			return nil, fmt.Errorf("replace config (bind mount fallback): %w", openErr)
+		}
+		_, writeErr := f.Write(out)
+		if writeErr == nil {
+			writeErr = f.Sync()
+		}
+		closeErr := f.Close()
+		// 写失败时保留 tmp（挂载文件已被 O_TRUNC 破坏，tmp 里是完整新内容，
+		// 可手工恢复）；写成功才清理。
+		if writeErr != nil {
+			return nil, fmt.Errorf("replace config (bind mount fallback, 完整新内容保留在 %s): %w", tmp, writeErr)
+		}
+		_ = os.Remove(tmp)
+		if closeErr != nil {
+			return nil, fmt.Errorf("replace config (bind mount fallback): %w", closeErr)
+		}
 	}
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
