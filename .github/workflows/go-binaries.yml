@@ -3,8 +3,10 @@ name: go-binaries
 # 可运行二进制构建/发布：
 #   - PR / push main → 测试 + 五平台编译验证（产物仅存 artifact，不发布）
 #   - push v* tag    → 同上 + 打包上传到 GitHub Release（zip/tar.gz + checksums）
-# 固化的发布纪律（曾两次人祸，见仓库 HANDOFF）：-s -w 剥离、二进制版本串 == 源码
-# appVersion、tag 版本 == 源码版本（-ci 后缀的测试 tag 豁免，用于演练发布线）。
+# 上游纪律：二进制版本串 == 源码 appVersion、tag 版本 == 源码版本（-ci 后缀的测试 tag 豁免）。
+# fork 偏离上游：上游用 -s -w 剥离符号，本 fork 的 Windows 产物只用 -w（去 DWARF 保留符号表）。
+#   原因：大体积 Go 二进制无符号表会被部分杀软（火绒/卡巴）启发式误判并删除，实测 -s 被删、-w 存活。
+#   fork 的 scripts/build-windows.ps1 同口径；Linux/darwin 产物同样统一 -w 以保持矩阵一致。
 on:
   push:
     branches: [main]
@@ -59,12 +61,22 @@ jobs:
         id: ver
         run: echo "v=$(grep -oP 'appVersion = "\K[^"]+' cmd/server/main.go)" >> "$GITHUB_OUTPUT"
 
-      - name: 构建（剥离符号，对齐本地发布口径）
+      - name: 构建（-w 去 DWARF，保留符号表——避免 Windows 杀软误报）
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
-        run: go build -ldflags "-s -w" -o "wb2api${{ matrix.goos == 'windows' && '.exe' || '' }}" ./cmd/server
+        run: go build -trimpath -ldflags "-w" -o "wb2api${{ matrix.goos == 'windows' && '.exe' || '' }}" ./cmd/server
+
+      # fork 独有：Windows 托盘启动器为独立二进制（构建约束 windows），非上游产物。
+      # -H windowsgui 去掉控制台窗口；与 scripts/build-windows.ps1 同口径。
+      - name: 构建托盘启动器（仅 Windows）
+        if: matrix.goos == 'windows'
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: go build -trimpath -ldflags "-w -H windowsgui" -o wb2api-tray.exe ./cmd/tray
 
       # 版本串断言：二进制必须含源码 appVersion（防交叉编译矩阵里编错树/漏 ldflags）
       - name: 断言二进制版本串
@@ -76,14 +88,15 @@ jobs:
           fi
           echo "version assert OK: ${{ steps.ver.outputs.v }}"
 
-      - name: 打包（windows=zip 三件套，其余=tar.gz）
+      - name: 打包（windows=zip 四件套，其余=tar.gz）
         run: |
           V="${{ steps.ver.outputs.v }}"
           V="${V%-panel}"   # 文件名不带 -panel 后缀（wb2api-panel-v1.2.3-... 既有惯例）
           case "${{ matrix.goos }}" in
             windows)
               NAME="wb2api-panel-v${V}-windows-amd64.zip"
-              zip -q "$NAME" wb2api.exe config.example.json README.md
+              # fork 独有：一并打进托盘启动器（wb2api.exe + wb2api-tray.exe 同目录即可用）
+              zip -q "$NAME" wb2api.exe wb2api-tray.exe config.example.json README.md
               ;;
             *)
               NAME="wb2api-panel-v${V}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz"
