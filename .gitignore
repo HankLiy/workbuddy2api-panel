@@ -45,3 +45,4 @@ docs/
 *.zip
 server.exe
 dist/
+.DS_Store

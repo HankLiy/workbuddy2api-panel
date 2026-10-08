@@ -148,6 +148,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			creditsEarliestExpiry:    s.CreditsEarliestExpiry,
 			creditsEarliestRemaining: s.CreditsEarliestRemaining,
 			disabled:                 s.Disabled,
+			paused:                   s.Paused,
 			reason:                   s.Reason,
 			until:                    s.Until,
 			coolKind:                 s.CoolKind,
@@ -155,6 +156,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			errTotal:                 errTotal,
 			lastErr:                  s.LastErr,
 			lastSuccess:              s.LastSuccess,
+			lastCheckinDay:           s.LastCheckinDay,
 			tokenUsage:               s.TokenUsage,
 			softStreak:               s.SoftStreak,
 			sessionDeadFails:         s.SessionDeadFails,
@@ -193,7 +195,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				if e.modelCooldowns == nil {
 					e.modelCooldowns = map[string]modelCooldown{}
 				}
-				e.modelCooldowns[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason}
+				e.modelCooldowns[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
 			}
 		}
 		// 成本账本：惰性过滤过期（modelCostTTL 外不恢复）+ 剔除结构破损条目
@@ -285,6 +287,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			Credits:                  e.credits,
 			CreditsTotal:             e.creditsTotal,
 			Disabled:                 e.disabled,
+			Paused:                   e.paused,
 			Reason:                   e.reason,
 			Until:                    e.until,
 			CoolKind:                 e.coolKind,
@@ -292,6 +295,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			ErrTotal:                 e.errTotal,
 			LastSuccess:              e.lastSuccess,
 			LastErr:                  e.lastErr,
+			LastCheckinDay:           e.lastCheckinDay,
 			TokenUsage:               e.tokenUsage,
 			SoftStreak:               e.softStreak,
 			SessionDeadFails:         e.sessionDeadFails,
@@ -320,7 +324,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 				if s.ModelCooldowns == nil {
 					s.ModelCooldowns = map[string]stateModelCooldown{}
 				}
-				s.ModelCooldowns[m] = stateModelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason}
+				s.ModelCooldowns[m] = stateModelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
 			}
 		}
 		// 成本账本：惰性过滤过期观测（modelCostTTL 外不写——陈旧价格不复活）。
